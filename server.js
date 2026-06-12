@@ -128,17 +128,55 @@ app.get('/api/admin/dashboard', authMiddleware, async (req, res) => {
 //  PRODUCTS
 // ════════════════════════════════════════════════════════════
 
-app.get('/api/admin/products', authMiddleware, async (req, res) => {
+app.get('/api/products', async (req, res) => {
   try {
     const db = await getPool();
-    const [rows] = await db.execute(`
-      SELECT p.*, c.name AS category_name
-      FROM products p
-      LEFT JOIN categories c ON p.category_id = c.id
-      ORDER BY p.created_at DESC
-    `);
-    res.json(rows);
+    const category = req.query.category || '';
+    const search   = req.query.search   || '';
+    const sort     = req.query.sort     || 'featured';
+    const page     = Math.max(1, parseInt(req.query.page)  || 1);
+    const limit    = Math.max(1, parseInt(req.query.limit) || 12);
+    const offset   = (page - 1) * limit;
+
+    let where  = 'WHERE p.is_active = 1';
+    const params = [];
+
+    if (category) {
+      where += ' AND c.slug = ?';
+      params.push(category);
+    }
+    if (search) {
+      where += ' AND (p.name LIKE ? OR p.short_desc LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    let orderBy = 'ORDER BY p.is_featured DESC, p.created_at DESC';
+    if (sort === 'price_asc')  orderBy = 'ORDER BY p.price ASC';
+    if (sort === 'price_desc') orderBy = 'ORDER BY p.price DESC';
+    if (sort === 'newest')     orderBy = 'ORDER BY p.created_at DESC';
+    if (sort === 'name')       orderBy = 'ORDER BY p.name ASC';
+
+    const [[{ total }]] = await db.execute(
+      `SELECT COUNT(*) AS total FROM products p LEFT JOIN categories c ON p.category_id = c.id ${where}`,
+      params
+    );
+
+    const [products] = await db.execute(
+      `SELECT p.*, c.name AS category_name, c.slug AS category_slug
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
+      params   // no limit/offset in params — they're inlined as integers above
+    );
+
+    res.json({
+      products,
+      total,
+      page,
+      pages: Math.ceil(total / limit),
+    });
   } catch (err) {
+    console.error(err);
     res.status(500).json({ error: err.message });
   }
 });
