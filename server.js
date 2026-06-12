@@ -15,7 +15,7 @@ const path    = require('path');
 
 const app = express();
 app.use(express.json({ limit: '10mb' }));
-app.use(cors());
+app.use(cors({ origin: '*' }));
 app.use(express.static(path.join(__dirname, '../Frontend')));
 
 // ── MySQL connection config ────────────────────────────────
@@ -34,14 +34,12 @@ const dbConfig = {
 let pool;
 async function getPool() {
   if (!pool) {
-    pool = await mysql.createPool(dbConfig);
+    pool = mysql.createPool(dbConfig); // no await here
   }
   return pool;
 }
 
-async function getPool() {
-  return await mysql.createConnection(dbConfig);
-}
+
 
 // ── JWT auth middleware ────────────────────────────────────
 const JWT_SECRET = process.env.JWT_SECRET || 'botanica_secret_change_me';
@@ -272,6 +270,57 @@ app.get('/api/admin/categories', authMiddleware, async (req, res) => {
   }
 });
 
+
+// ── PUBLIC PRODUCTS (for shop page) ──────────────────────
+app.get('/api/products', async (req, res) => {
+  try {
+    const db = await getPool();
+    const { category, search, sort, page = 1, limit = 12 } = req.query;
+    const offset = (parseInt(page) - 1) * parseInt(limit);
+
+    let where = 'WHERE p.is_active = 1';
+    const params = [];
+
+    if (category) {
+      where += ' AND c.slug = ?';
+      params.push(category);
+    }
+    if (search) {
+      where += ' AND (p.name LIKE ? OR p.short_desc LIKE ?)';
+      params.push(`%${search}%`, `%${search}%`);
+    }
+
+    let orderBy = 'ORDER BY p.is_featured DESC, p.created_at DESC';
+    if (sort === 'price_asc')  orderBy = 'ORDER BY p.price ASC';
+    if (sort === 'price_desc') orderBy = 'ORDER BY p.price DESC';
+    if (sort === 'newest')     orderBy = 'ORDER BY p.created_at DESC';
+    if (sort === 'name')       orderBy = 'ORDER BY p.name ASC';
+
+    const [[{ total }]] = await db.execute(
+      `SELECT COUNT(*) AS total FROM products p LEFT JOIN categories c ON p.category_id = c.id ${where}`,
+      params
+    );
+
+    const [products] = await db.execute(
+      `SELECT p.*, c.name AS category_name, c.slug AS category_slug
+       FROM products p
+       LEFT JOIN categories c ON p.category_id = c.id
+       ${where} ${orderBy} LIMIT ? OFFSET ?`,
+      [...params, parseInt(limit), offset]
+    );
+
+    res.json({
+      products,
+      total,
+      page: parseInt(page),
+      pages: Math.ceil(total / parseInt(limit)),
+    });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
 // ════════════════════════════════════════════════════════════
 //  START
 // ════════════════════════════════════════════════════════════
@@ -279,4 +328,76 @@ const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log(`\n✅  Botanica API running → http://localhost:${PORT}`);
   console.log(`   Admin panel: http://localhost:${PORT}/admin-login.html\n`);
+});
+
+
+// ════════════════════════════════════════════════════════════
+//  YOCO PAYMENT
+//  Add this route to your server.js BEFORE the app.listen line
+// ════════════════════════════════════════════════════════════
+
+// POST /api/payment/charge
+app.post('/api/payment/charge', async (req, res) => {
+  const { token, amountInCents, currency, order } = req.body;
+
+  if (!token || !amountInCents) {
+    return res.status(400).json({ error: 'Missing payment details' });
+  }
+
+  try {
+    // Charge via Yoco API
+    const yocoRes = await fetch('https://online.yoco.com/v1/charges/', {
+      method: 'POST',
+      headers: {
+        'X-Auth-Secret-Key': process.env.YOCO_SECRET_KEY || 'YOUR_YOCO_SECRET_KEY',
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({
+        token,
+        amountInCents,
+        currency: currency || 'ZAR',
+      }),
+    });
+
+    const yocoData = await yocoRes.json();
+
+    if (!yocoRes.ok || yocoData.status !== 'successful') {
+      return res.status(400).json({ error: yocoData.displayMessage || 'Payment failed' });
+    }
+
+    // Save order to database
+    const db = await getPool();
+    const [result] = await db.execute(
+      `INSERT INTO orders (guest_email, customer_name, total, status, payment_method, notes)
+       VALUES (?, ?, ?, 'paid', 'yoco', ?)`,
+      [
+        order.email,
+        `${order.firstName} ${order.lastName}`,
+        amountInCents / 100,
+        JSON.stringify({ address: order.address, city: order.city, province: order.province, postal: order.postal }),
+      ]
+    );
+
+    const orderId = result.insertId;
+
+    // Save order items
+    if (order.items && order.items.length) {
+      for (const item of order.items) {
+        await db.execute(
+          `INSERT INTO order_items (order_id, name, price, qty) VALUES (?, ?, ?, ?)`,
+          [orderId, item.name, item.price, item.qty]
+        );
+      }
+    }
+
+    res.json({
+      success: true,
+      orderId,
+      orderNumber: `BOT-${orderId.toString().padStart(6, '0')}`,
+    });
+
+  } catch (err) {
+    console.error('Payment error:', err);
+    res.status(500).json({ error: 'Payment processing failed' });
+  }
 });
