@@ -166,15 +166,26 @@ app.get('/api/products', async (req, res) => {
        FROM products p
        LEFT JOIN categories c ON p.category_id = c.id
        ${where} ${orderBy} LIMIT ${limit} OFFSET ${offset}`,
-      params   // no limit/offset in params — they're inlined as integers above
+      params
     );
 
-    res.json({
-      products,
-      total,
-      page,
-      pages: Math.ceil(total / limit),
-    });
+    res.json({ products, total, page, pages: Math.ceil(total / limit) });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: err.message });
+  }
+});
+
+app.get('/api/admin/products', authMiddleware, async (req, res) => {
+  try {
+    const db = await getPool();
+    const [products] = await db.execute(`
+      SELECT p.*, c.name AS category_name, c.slug AS category_slug
+      FROM products p
+      LEFT JOIN categories c ON p.category_id = c.id
+      ORDER BY p.created_at DESC
+    `);
+    res.json(products);
   } catch (err) {
     console.error(err);
     res.status(500).json({ error: err.message });
